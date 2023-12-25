@@ -1,9 +1,11 @@
-use log::{debug, info};
+use async_recursion::async_recursion;
+use log::debug;
+use raft_service::raft_client::RaftClient;
 use rand::Rng;
 use tokio::sync::Mutex;
 use tokio::time;
 
-use crate::{raft_service, RaftService};
+use crate::raft_service;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum CMState {
@@ -29,7 +31,7 @@ struct LogEntry {
     command: String,
 }
 
-struct ConsensusModuleData<'a> {
+struct ConsensusModuleData {
     // The id of this server.
     id: u64,
     // The ids of the other servers.
@@ -47,19 +49,23 @@ struct ConsensusModuleData<'a> {
     // The log of commands that the server needs to keep track of.
     log: Vec<LogEntry>,
 
-    server: &'a mut RaftService,
+    peer_clients: Vec<RaftClient<tonic::transport::Channel>>,
 }
 /// A Raft server.
 /// I'm forced to do this now where the type is cm.data.id etc
 /// But i'd rather it just be cm.id etc.
 /// Don't know how to do that yet, while still locking it.
-pub struct ConsensusModule<'a> {
-    data: Mutex<ConsensusModuleData<'a>>,
+pub struct ConsensusModule {
+    data: Mutex<ConsensusModuleData>,
 }
 
-impl<'a> ConsensusModule<'a> {
-    pub fn new(id: u64, peer_ids: Vec<u64>, server: &'a mut RaftService) -> ConsensusModule<'a> {
-        ConsensusModule {
+impl ConsensusModule {
+    pub async fn new(
+        id: u64,
+        peer_ids: Vec<u64>,
+        peer_clients: Vec<RaftClient<tonic::transport::Channel>>,
+    ) -> ConsensusModule {
+        let cm = ConsensusModule {
             data: Mutex::new(ConsensusModuleData {
                 id,
                 peer_ids,
@@ -68,9 +74,13 @@ impl<'a> ConsensusModule<'a> {
                 state: CMState::Follower,
                 election_reset_event: time::Instant::now(),
                 log: vec![],
-                server,
+                peer_clients,
             }),
-        }
+        };
+
+        cm.data.lock().await.election_reset_event = time::Instant::now();
+        cm.run_election_timer().await;
+        return cm;
     }
 
     fn election_timeout(&self) -> time::Duration {
@@ -87,12 +97,13 @@ impl<'a> ConsensusModule<'a> {
     }
 
     async fn leader_send_heartbeats(&self) {
-        let mut data = self.data.lock().await;
+        let data = self.data.lock().await;
         if data.state != CMState::Leader {
             return;
         }
-        let mut peer_clients = data.server.data.lock().await.peer_clients.clone();
-        let mut peer_ids = data.server.data.lock().await.peer_ids.clone();
+        let current_term = data.current_term;
+        let mut peer_clients = data.peer_clients.clone();
+        let mut peer_ids = data.peer_ids.clone();
         let mut peer_clients_iter = peer_clients.iter_mut();
         let mut peer_ids_iter = peer_ids.iter_mut();
         let mut peer_client = peer_clients_iter.next();
@@ -111,7 +122,7 @@ impl<'a> ConsensusModule<'a> {
                 .await
                 .unwrap()
                 .into_inner();
-            if reply.term > data.current_term {
+            if reply.term > current_term {
                 self.become_follower(reply.term).await;
                 return;
             }
@@ -134,10 +145,77 @@ impl<'a> ConsensusModule<'a> {
         }
     }
 
-    async fn start_election(
+    pub async fn stop(&self) {
+        let mut data = self.data.lock().await;
+        data.state = CMState::Dead;
+    }
+
+    pub async fn append_entries(
         &self,
-        data: &mut tokio::sync::MutexGuard<'_, ConsensusModuleData<'_>>,
-    ) {
+        args: raft_service::AppendEntriesArgs,
+    ) -> Option<raft_service::AppendEntriesReply> {
+        let mut data = self.data.lock().await;
+        if data.state == CMState::Dead {
+            return None;
+        }
+        debug!("{} got an append entries request", data.id);
+        if args.term > data.current_term {
+            debug!(
+                "{} got an append entries request with a higher term",
+                data.id
+            );
+            self.become_follower(args.term).await;
+        }
+        if data.current_term == args.term {
+            if data.state != CMState::Follower {
+                self.become_follower(args.term).await;
+            }
+            data.election_reset_event = time::Instant::now();
+            return Some(raft_service::AppendEntriesReply {
+                term: data.current_term,
+                success: true,
+            });
+        } else {
+            return Some(raft_service::AppendEntriesReply {
+                term: data.current_term,
+                success: false,
+            });
+        }
+    }
+
+    pub async fn request_vote(
+        &self,
+        args: raft_service::RequestVoteArgs,
+    ) -> Option<raft_service::RequestVoteReply> {
+        let mut data = self.data.lock().await;
+        if data.state == CMState::Dead {
+            return None;
+        }
+        debug!("{} got a request vote request", data.id);
+        if args.term > data.current_term {
+            debug!("{} got a request vote request with a higher term", data.id);
+            self.become_follower(args.term).await;
+        }
+        if data.current_term == args.term
+            && (data.voted_for.is_none() || data.voted_for.unwrap() == args.candidate_id)
+        {
+            debug!("{} voted for {}", data.id, args.candidate_id);
+            data.voted_for = Some(args.candidate_id);
+            return Some(raft_service::RequestVoteReply {
+                term: data.current_term,
+                vote_granted: true,
+            });
+        } else {
+            debug!("{} did not vote for {}", data.id, args.candidate_id);
+            return Some(raft_service::RequestVoteReply {
+                term: data.current_term,
+                vote_granted: false,
+            });
+        }
+    }
+
+    #[async_recursion]
+    async fn start_election(&self, data: &mut tokio::sync::MutexGuard<'_, ConsensusModuleData>) {
         data.state = CMState::Candidate;
         data.current_term += 1;
         let saved_current_term = data.current_term;
@@ -154,10 +232,20 @@ impl<'a> ConsensusModule<'a> {
         };
 
         for peer_id in data.peer_ids.clone() {
-            let reply = data
-                .server
-                .request_vote(peer_id.clone() as usize, request_vote_args.clone())
-                .await;
+            let client = data.peer_clients.get_mut(peer_id as usize);
+
+            let reply = match client {
+                Some(client) => {
+                    let reply = client
+                        .request_vote(request_vote_args.clone())
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    reply
+                }
+                None => panic!("No peer client found"),
+            };
+
             if data.state != CMState::Candidate {
                 return;
             }
@@ -173,6 +261,8 @@ impl<'a> ConsensusModule<'a> {
                 }
             }
         }
+
+        self.run_election_timer().await;
     }
 
     pub async fn run_election_timer(&self) {
