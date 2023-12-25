@@ -5,4 +5,23 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]] # Bin to run the HelloWorld gRPC server
+name = "raft-server"
+path = "src/server.rs"
+
+# [[bin]] # Bin to run the HelloWorld gRPC client
+# name = "raft-client"
+# path = "src/client.rs"
+
+
 [dependencies]
+tokio = { version = "1.35.1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tonic = "0.10"
+prost = "0.12"
+rand = "0.8.5"
+log = "0.4.20"
+
+[build-dependencies]
+tonic-build = "0.10"
